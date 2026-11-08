@@ -1,0 +1,72 @@
+// Step 4 - DAX measures. Create a table "_Measures" (Enter Data, blank) and add these there.
+// Model relationships (all single direction, many-to-one, fact -> dim):
+//   FactSales[DateKey]     -> DimDate[DateKey]
+//   FactSales[CustomerKey] -> DimCustomer[CustomerKey]
+//   FactSales[ProductKey]  -> DimProduct[ProductKey]
+//   FactTarget[MonthStart] -> DimDate[MonthStart]  (use a DISTINCT month table if Power BI complains about uniqueness)
+// Mark DimDate as a Date table on DimDate[Date].
+
+// ---------- Base ----------
+Revenue        = SUM ( FactSales[NetAmount] )
+Gross Revenue  = SUM ( FactSales[GrossAmount] )
+Cost           = SUM ( FactSales[CostAmount] )
+Profit         = [Revenue] - [Cost]
+Orders         = DISTINCTCOUNT ( FactSales[OrderID] )
+Units Sold     = SUM ( FactSales[Quantity] )
+Customers      = DISTINCTCOUNT ( FactSales[CustomerKey] )
+
+// ---------- Ratios ----------
+Margin %       = DIVIDE ( [Profit], [Revenue] )
+Avg Order Value = DIVIDE ( [Revenue], [Orders] )
+Discount Given = [Gross Revenue] - [Revenue]
+Discount %     = DIVIDE ( [Discount Given], [Gross Revenue] )
+
+// ---------- Time intelligence ----------
+Revenue YTD    = TOTALYTD ( [Revenue], DimDate[Date] )
+Revenue PY     = CALCULATE ( [Revenue], SAMEPERIODLASTYEAR ( DimDate[Date] ) )
+YoY Growth %   = DIVIDE ( [Revenue] - [Revenue PY], [Revenue PY] )
+Revenue PM     = CALCULATE ( [Revenue], DATEADD ( DimDate[Date], -1, MONTH ) )
+MoM Growth %   = DIVIDE ( [Revenue] - [Revenue PM], [Revenue PM] )
+Revenue 3M Avg =
+AVERAGEX ( DATESINPERIOD ( DimDate[Date], MAX ( DimDate[Date] ), -3, MONTH ), [Revenue] )
+
+// ---------- Target vs actual ----------
+Revenue Target = SUM ( FactTarget[RevenueTarget] )
+Target Attainment % = DIVIDE ( [Revenue], [Revenue Target] )
+Target Gap     = [Revenue] - [Revenue Target]
+Target Status  =
+SWITCH ( TRUE (),
+    [Target Attainment %] >= 1,    "On target",
+    [Target Attainment %] >= 0.9,  "Close",
+    "Behind" )
+Target Color =                      // use in conditional formatting (Field value)
+SWITCH ( [Target Status], "On target", "#2E9E5B", "Close", "#E0A100", "#D64545" )
+
+// ---------- Ranking / share ----------
+Revenue % of Total = DIVIDE ( [Revenue], CALCULATE ( [Revenue], ALL ( DimProduct ) ) )
+Product Rank       = RANKX ( ALL ( DimProduct[ProductName] ), [Revenue] )
+Top 5 Products Revenue =
+CALCULATE ( [Revenue], TOPN ( 5, ALL ( DimProduct[ProductName] ), [Revenue] ) )
+
+// ---------- Customer ----------
+New Customers =
+VAR firstOrders =
+    ADDCOLUMNS ( VALUES ( DimCustomer[CustomerKey] ),
+        "@first", CALCULATE ( MIN ( DimDate[Date] ), ALL ( DimDate ) ) )
+RETURN COUNTROWS ( FILTER ( firstOrders, [@first] >= MIN ( DimDate[Date] ) && [@first] <= MAX ( DimDate[Date] ) ) )
+
+// ---------- Dynamic title ----------
+Title Subtitle = "Revenue " & FORMAT ( [Revenue], "#,0" ) & " TND | Margin " & FORMAT ( [Margin %], "0.0%" )
+
+// ================= DAILY TREND (added for the daily-load flow) =================
+// Also import tables LoadLog and (optional) view vw_DailyKpi.
+Last Load Date   = CALCULATE ( MAX ( DimDate[Date] ), REMOVEFILTERS ( DimDate ), FactSales )   // newest date with data
+Last Refresh Run = MAX ( LoadLog[LoadedAt] )
+Show Date        = IF ( MAX ( DimDate[Date] ) <= [Last Load Date], 1, 0 )   // visual filter "Show Date = 1" hides future days
+Revenue Prev Day = CALCULATE ( [Revenue], DATEADD ( DimDate[Date], -1, DAY ) )
+DoD Growth %     = DIVIDE ( [Revenue] - [Revenue Prev Day], [Revenue Prev Day] )
+Revenue 7D Avg   = AVERAGEX ( DATESINPERIOD ( DimDate[Date], MAX ( DimDate[Date] ), -7, DAY ), [Revenue] )
+Revenue MTD      = TOTALMTD ( [Revenue], DimDate[Date] )
+Revenue Last Day = CALCULATE ( [Revenue], DimDate[Date] = [Last Load Date] )
+Orders Last Day  = CALCULATE ( [Orders],  DimDate[Date] = [Last Load Date] )
+Trend Arrow      = IF ( [DoD Growth %] >= 0, "▲ ", "▼ " ) & FORMAT ( ABS ( [DoD Growth %] ), "0.0%" )
