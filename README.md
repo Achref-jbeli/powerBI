@@ -1,101 +1,129 @@
 # Power BI – Excel → SQL Server → KPI → Dashboard (chargement quotidien automatique)
 
-Projet d'exemple : des fichiers Excel déposés chaque jour dans un dossier daté sont chargés
-automatiquement dans SQL Server, puis le dashboard Power BI est actualisé et affiche la tendance par jour.
+Flux complet **sans Python ni pip** : PowerShell + ADO.NET natif + SQL Server Agent.
 
 ```
 inbox\2026-11-08\sales_2026-11-08.xlsx      (un dossier par jour, nom = AAAA-MM-JJ)
-        │  tâche planifiée → run_daily.ps1 → load_daily.py
+        │  SQL Server Agent Job (06:30) → run_daily.ps1 → load_daily.ps1
         │    • date déjà chargée (LoadLog = Success) → on ne fait rien
-        │    • date nouvelle → tables stg_* → usp_LoadDay (incrémental) → LoadLog
+        │    • date nouvelle → stg_* → usp_LoadDay (incrémental) → LoadLog
         ▼
 SQL Server « SalesKpiDW » : schéma en étoile + vues vw_MonthlyKpi, vw_DailyKpi, vw_CustomerRfm
-        │  refresh_powerbi.ps1 (seulement si de nouvelles données) ou actualisation planifiée du service
+        │  refresh_powerbi.ps1 (uniquement si nouvelles données)
         ▼
 Power BI : modèle + mesures DAX (powerbi/measures.dax) + pages (powerbi/dashboard_layout.md)
 ```
 
-## 1. Prérequis
+## Prérequis
 | Outil | Remarque |
 |---|---|
-| SQL Server (Express suffit) + SSMS ou `sqlcmd` | serveur par défaut du projet : `localhost\SQLEXPRESS` |
-| ODBC Driver 17 pour SQL Server | si vous avez le 18, remplacez `17` par `18` dans `CONN` |
-| Python 3.9+ | |
+| SQL Server (Express suffit) + SSMS ou `sqlcmd` | serveur par défaut : `localhost\SQLEXPRESS` |
+| PowerShell 5.1+ | déjà présent sur Windows 10/11 |
+| Microsoft ACE OleDb 2016 | lit les fichiers Excel sans Python — [télécharger ici](https://www.microsoft.com/en-us/download/details.aspx?id=54920) (gratuit, sans pip) |
+| Microsoft Excel | uniquement pour `generate_sample_excel.ps1` (données de test) |
 | Power BI Desktop | gratuit (Microsoft Store) |
 
-## 2. Installation (une seule fois)
-Dans PowerShell, depuis le dossier du projet :
+> **SQL Server Express** n'inclut pas SQL Server Agent.
+> Utilisez `register_daily_task.ps1` (Planificateur de tâches Windows) à la place de `sql\03_agent_job.sql`.
+
+---
+
+## 1. Installation (une seule fois)
+
 ```powershell
-# a) Paquets Python
-pip install -r requirements.txt
+cd C:\Users\achre\Downloads\PowerBI-Sales-Example
 
-# b) Base de données : tables, schéma en étoile, vues   (ATTENTION : 01 efface les tables existantes)
-sqlcmd -S "localhost\SQLEXPRESS" -E -C -i sql\01_schema.sql
+# Tout en une commande :
+.\setup.ps1
 
-# c) Chargement quotidien : LoadLog, procédure usp_LoadDay, vue vw_DailyKpi   (non destructif)
-sqlcmd -S "localhost\SQLEXPRESS" -E -C -i sql\02_daily_load.sql
+# Ou étape par étape :
+sqlcmd -S "localhost\SQLEXPRESS" -E -C -i sql\01_schema.sql   # crée la base et les tables
+sqlcmd -S "localhost\SQLEXPRESS" -E -C -i sql\02_daily_load.sql  # LoadLog + usp_LoadDay + vw_DailyKpi
+.\generate_sample_excel.ps1    # crée data\sales_data.xlsx (données de test, nécessite Excel)
+.\load_excel_to_db.ps1         # charge l'historique initial
 ```
-Ou tout en une commande : `.\setup.ps1` (installe, crée la base et charge l'historique d'exemple).
 
-Un autre serveur ? Modifiez `SERVER=` dans `CONN` (en haut de `load_excel_to_db.py` et `load_daily.py`)
-et `-S` dans les commandes `sqlcmd`.
+Un autre serveur ? Modifiez `$Server` en haut de chaque script `.ps1` ou passez `-Server "..."`.
 
-## 3. Chargement
-### 3.1 Historique initial (une fois)
+---
+
+## 2. Chargement quotidien
+
+### Structure des dossiers
+```
+inbox\
+  2026-11-08\
+    sales_2026-11-08.xlsx      ← feuille "Sales" obligatoire
+  2026-11-09\
+    sales_2026-11-09.xlsx
+```
+
+Feuille **Sales** requise : `OrderID, OrderDate, CustomerID, ProductID, Quantity, DiscountPct`
+Feuilles facultatives : `Customers`, `Products`, `Targets`
+
+### Lancer manuellement
 ```powershell
-python generate_sample_excel.py      # crée data\sales_data.xlsx (données d'exemple)
-python load_excel_to_db.py           # ou : python load_excel_to_db.py "C:\chemin\fichier.xlsx"
+.\load_daily.ps1
+# [2026-11-08] chargé : 95 nouvelles commandes depuis sales_2026-11-08.xlsx
+# [2026-11-07] déjà chargé -> ignoré
 ```
-### 3.2 Chargement quotidien
-1. Déposez le fichier du jour dans un dossier nommé par la date : `inbox\2026-11-08\mon_fichier.xlsx`
-   (feuille **Sales** obligatoire : `OrderID, OrderDate, CustomerID, ProductID, Quantity, DiscountPct` ;
-   feuilles facultatives : `Customers`, `Products`, `Targets`).
-2. Lancez :
-   ```powershell
-   python load_daily.py
-   ```
-   - date déjà chargée → `already loaded -> skipped`, rien n'est fait
-   - date nouvelle → chargée dans la base et inscrite dans `LoadLog`
+Codes de sortie : `0` nouvelles données · `2` rien de nouveau · `1` échec (voir `logs\` et `LoadLog`)
 
-   Codes de sortie : `0` nouvelles données chargées · `2` rien de nouveau · `1` échec (voir `LoadLog` et `logs\`).
-3. Pour tester sans vos données : `python generate_daily_files.py 2026-11-01 7` crée 7 dossiers de test.
-
-### 3.3 Automatiser (tous les jours)
+### Automatiser avec SQL Server Agent (Standard/Developer)
 ```powershell
-.\register_daily_task.ps1 -Time 06:30      # crée la tâche Windows « SalesKpi_DailyLoad »
+# Crée le job "SalesKpi_DailyLoad" à 06:30
+sqlcmd -S "localhost\SQLEXPRESS" -E -C -i sql\03_agent_job.sql
 ```
-`run_daily.ps1` charge les nouveaux dossiers, écrit un journal dans `logs\`, puis déclenche l'actualisation
-Power BI **uniquement** s'il y a eu de nouvelles données.
 
-### 3.4 Vérifier
+### Automatiser avec le Planificateur de tâches (Express)
+```powershell
+.\register_daily_task.ps1 -Time 06:30
+```
+
+### Vérifier
 ```powershell
 sqlcmd -S "localhost\SQLEXPRESS" -E -C -d SalesKpiDW -Q "SELECT TOP 5 * FROM LoadLog ORDER BY LogID DESC; SELECT TOP 7 * FROM vw_DailyKpi ORDER BY [Date] DESC"
 ```
 
-## 4. Power BI Desktop
+---
+
+## 3. Power BI Desktop
+
 1. **Obtenir les données → SQL Server** : serveur `localhost\SQLEXPRESS`, base `SalesKpiDW`, mode **Import**.
    Tables : `FactSales, DimCustomer, DimProduct, DimDate, FactTarget, LoadLog`.
-2. Relations (plusieurs-à-un, sens unique) : `FactSales[DateKey]→DimDate[DateKey]`, `[CustomerKey]→DimCustomer`,
-   `[ProductKey]→DimProduct`, `FactTarget[MonthStart]→DimDate[MonthStart]`. Marquer `DimDate` comme table de dates (`Date`).
-3. Table vide `_Measures` (Entrer des données) puis coller les mesures de `powerbi\measures.dax` **une par une**
-   (Revenue, Cost, Profit, Margin % en premier).
-4. Construire les pages selon `powerbi\dashboard_layout.md` (la page 4 = tendance par jour ;
+2. **Relations** (plusieurs-à-un, sens unique) :
+   - `FactSales[DateKey]` → `DimDate[DateKey]`
+   - `FactSales[CustomerKey]` → `DimCustomer[CustomerKey]`
+   - `FactSales[ProductKey]` → `DimProduct[ProductKey]`
+   - `FactTarget[MonthStart]` → `DimDate[MonthStart]`
+   - Marquer `DimDate` comme table de dates (colonne `Date`).
+3. **Mesures** : créer une table vide `_Measures`, puis coller les mesures de `powerbi\measures.dax` une par une
+   (commencer par `Revenue`, `Cost`, `Profit`, `Margin %`).
+4. **Pages** : suivre `powerbi\dashboard_layout.md` (page 4 = tendance quotidienne ;
    filtre visuel `Show Date = 1` sur la courbe).
 
-## 5. Actualisation automatique du dashboard
-Power BI Desktop ne s'actualise pas seul. Publiez le rapport sur Power BI Service, puis :
-- installez une **passerelle de données locale** (le SQL Server est sur votre PC) ;
-- **Jeu de données → Paramètres → Actualisation planifiée** (par ex. 07:00, après le chargement de 06:30) ;
-- ou renseignez les IDs dans `refresh_powerbi.ps1` pour déclencher l'actualisation juste après chaque chargement.
+---
 
-## 6. Dépannage
+## 4. Actualisation automatique du dashboard
+
+| Scénario | Solution |
+|---|---|
+| Power BI Desktop seulement | Cliquer **Actualiser** après chaque chargement |
+| Power BI Service (automatique) | Publier + passerelle de données locale + actualisation planifiée à 07:00 |
+| Déclenchement immédiat après chargement | Renseigner les IDs dans `refresh_powerbi.ps1` |
+
+---
+
+## 5. Dépannage
+
 | Erreur | Solution |
 |---|---|
-| `Data source name not found` | nom du driver ODBC (17/18) dans `CONN` |
-| `Invalid object name 'stg_...'` / `usp_LoadDay` | étape 2 (b, c) non exécutée |
-| `Échec de INSERT ... options SET` | relancer `02_daily_load.sql` (il contient `SET QUOTED_IDENTIFIER ON`) |
-| Date « skipped » alors qu'on veut la recharger | `DELETE FROM LoadLog WHERE LoadDate='AAAA-MM-JJ'` (les commandes déjà présentes ne sont pas dupliquées) |
-| Courbe jusqu'au 31 décembre | filtre visuel `Show Date = 1` |
+| `The 'Microsoft.ACE.OLEDB.12.0' provider is not registered` | Installer [ACE OleDb 2016](https://www.microsoft.com/en-us/download/details.aspx?id=54920) |
+| `Invalid object name 'stg_...'` | Relancer `sql\01_schema.sql` dans SSMS |
+| `Échec de INSERT ... options SET` | Relancer `sql\02_daily_load.sql` |
+| Date « ignorée » à recharger | `DELETE FROM LoadLog WHERE LoadDate='AAAA-MM-JJ'` dans SSMS |
+| SQL Server Agent absent | Utiliser `register_daily_task.ps1` (Planificateur Windows) |
+| Courbe Power BI jusqu'au 31 décembre | Ajouter filtre visuel `Show Date = 1` |
 
-> Un fichier `.pbix` ne peut pas être généré par code : le rapport se construit dans Power BI Desktop
-> à partir du modèle et des mesures fournis.
+> Un fichier `.pbix` ne peut pas être généré par script : le rapport se construit dans Power BI Desktop
+> à partir du modèle et des mesures fournis dans `powerbi\`.

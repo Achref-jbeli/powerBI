@@ -1,19 +1,19 @@
-# Daily job: load new date folders into SQL Server, then refresh the Power BI dataset if something new arrived.
-# Scheduled by register_daily_task.ps1
+# run_daily.ps1 - Lancé par la tâche SQL Server Agent chaque jour.
+# Charge les nouveaux dossiers, puis déclenche l'actualisation Power BI si de nouvelles données.
 Set-Location $PSScriptRoot
-$log = Join-Path $PSScriptRoot "logs"
-New-Item -ItemType Directory -Force $log | Out-Null
-$logFile = Join-Path $log ("run_{0:yyyy-MM-dd}.log" -f (Get-Date))
+$logDir = Join-Path $PSScriptRoot "logs"
+New-Item -ItemType Directory -Force $logDir | Out-Null
+$logFile = Join-Path $logDir ("run_{0:yyyy-MM-dd}.log" -f (Get-Date))
 
-python load_daily.py *>> $logFile
+& "$PSScriptRoot\load_daily.ps1" *>> $logFile
 $code = $LASTEXITCODE
 
 if ($code -eq 0) {
-    "New data loaded -> refreshing Power BI" | Out-File $logFile -Append
+    "Nouvelles données chargées -> actualisation Power BI" | Out-File $logFile -Append
     if (Test-Path "$PSScriptRoot\refresh_powerbi.ps1") { & "$PSScriptRoot\refresh_powerbi.ps1" *>> $logFile }
 } elseif ($code -eq 2) {
-    "Nothing new -> no refresh needed" | Out-File $logFile -Append
+    "Rien de nouveau -> pas d'actualisation" | Out-File $logFile -Append
 } else {
-    "LOAD FAILED (see above)" | Out-File $logFile -Append
+    "ECHEC DU CHARGEMENT (voir ci-dessus)" | Out-File $logFile -Append
 }
 exit $code
